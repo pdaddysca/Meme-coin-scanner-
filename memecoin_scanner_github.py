@@ -1,40 +1,38 @@
+
 """
-Meme Coin Scanner Bot — GitHub Actions version (v2, with strict corrections)
+Meme Coin Scanner Bot — GitHub Actions version (v3, Moralis removed)
 -----------------------------------------------------------------------------
 Single scan per invocation — GitHub Actions' own schedule handles repeating.
 Alert-only. Does NOT buy or execute anything.
 
+NOTE: Moralis discontinued its free tier (Aug 2026) — removed from this
+script. Holder count + top-10 concentration now come from GoPlus Security
+instead, which is free with no signup/key needed at all. One less account
+to manage.
+
 CORRECTIONS APPLIED (per your instructions, in your stated order):
-  1. Only alert if 1h price change is between +5% and +40% (excludes already-pumped coins)
+  1. Only alert if 1h price change is between +5% and +40%
   2. Only alert on pools less than 30 minutes old
   3. Holder count unknown (N/A) = automatic FAIL, not a skip
   4. Top 10 holders must hold less than 30% of supply
   9. Token price logged at the moment of the signal (signal_log.json)
   5. Minimum liquidity raised to $25,000
-  6. Blocked if 24h volume is more than 15x liquidity (pump/wash-trade signal)
+  6. Blocked if 24h volume is more than 15x liquidity
   7. Blocked if name is a duplicate/near-duplicate of a previously alerted token
-  8. Ethereum tokens: must pass LP-lock + honeypot check (GoPlus Security), else skipped
-  10. Blocked if RugCheck score is risky (Solana only, where RugCheck applies)
+  8. Ethereum tokens: must pass LP-lock + honeypot check, else skipped
+  10. Blocked if RugCheck score is risky (Solana only)
 
-IMPORTANT HONESTY NOTE: with all of these stacked together, this is a very
-tight filter. Expect few or even zero alerts in many scan windows — that is
-the intended effect of tightening the rules this much, not a bug. Test for
-30+ signals on paper (correction #4 in your "order of work") before trusting
-it with real money, and loosen specific thresholds in FILTERS if it's too
-quiet to be useful.
-
-Checks that FAIL CLOSED (block when data can't be verified, by design, per
-your "fail if unknown" instruction on holders): holder count, top-10
-concentration, Ethereum LP-lock/honeypot, RugCheck score (Solana).
-Checks that still skip gracefully when data is unavailable: bubble map
-cluster check (best-effort, not in your correction list).
+HONESTY NOTE: with all of these stacked together, expect few or zero alerts
+in many scan windows — that's the intended effect, not a bug. GoPlus's
+Solana support is newer and less battle-tested than its Ethereum/Base
+support — watch its output during paper testing to confirm it's returning
+sane numbers before trusting it.
 
 DATA SOURCES:
   - DexScreener (free, no key)      -> price, liquidity, volume, age, socials
   - RugCheck (free, Solana only)    -> risk score
-  - Moralis (free tier, needs key)  -> holder count + top-10 concentration
+  - GoPlus Security (free, no key)  -> holder count, top-10 %, LP lock, honeypot
   - Bubblemaps (unofficial)         -> linked-wallet cluster %, best-effort
-  - GoPlus Security (free, no key)  -> Ethereum LP lock + honeypot check
   - Telegram Bot API                -> sends the alert
 
 CONFIG: values below come from environment variables (GitHub Secrets),
@@ -51,16 +49,10 @@ import difflib
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-MORALIS_API_KEY = os.environ.get("MORALIS_API_KEY", "")  # optional but needed for holder checks
 
 CHAINS = ["solana", "base", "ethereum"]
 
-MORALIS_CHAIN_MAP = {
-    "ethereum": "eth",
-    "base": "base",
-}
-
-# GoPlus Security chain IDs (used for the Ethereum LP-lock/honeypot check)
+# GoPlus Security chain IDs (EVM chains use numeric IDs; Solana has its own path)
 GOPLUS_CHAIN_MAP = {
     "ethereum": "1",
     "base": "8453",
@@ -70,22 +62,22 @@ FILTERS = {
     "min_liquidity_usd": 25000,          # correction 5
     "max_age_minutes": 30,               # correction 2
     "min_volume_24h_usd": 20000,
-    "min_vol_to_liq_ratio": 0.5,         # keep as a quality-of-activity floor
+    "min_vol_to_liq_ratio": 0.5,
     "max_vol_to_liq_ratio": 15,          # correction 6
     "min_price_change_1h_pct": 5,        # correction 1 (lower bound)
     "max_price_change_1h_pct": 40,       # correction 1 (upper bound)
     "require_social_link": True,
     "min_holder_count": 50,
     "max_top10_holder_pct": 30,          # correction 4
-    "max_cluster_pct": 25,               # bubble map check (unchanged, best-effort)
-    "name_similarity_threshold": 0.85,   # correction 7 (0-1, higher = stricter match needed)
+    "max_cluster_pct": 25,               # bubble map check, best-effort
+    "name_similarity_threshold": 0.85,   # correction 7
     "max_rugcheck_score": 50,            # correction 10 (adjust once you see real scores)
-    "min_lp_locked_pct": 50,             # correction 8 (Ethereum LP lock threshold)
+    "min_lp_locked_pct": 50,             # correction 8
 }
 
-SEEN_FILE = "seen_tokens.json"           # token addresses already checked
-NAMES_FILE = "alerted_names.json"        # names of tokens already alerted on (duplicate check)
-SIGNAL_LOG_FILE = "signal_log.json"      # price-at-signal log for paper testing
+SEEN_FILE = "seen_tokens.json"
+NAMES_FILE = "alerted_names.json"
+SIGNAL_LOG_FILE = "signal_log.json"
 
 # ============ STATE ============
 
@@ -136,72 +128,63 @@ def get_pair_data(chain_id, token_address):
         print(f"[error] fetching pair data for {token_address}: {e}")
         return None
 
-def get_holder_count(chain_id, token_address):
-    """Correction 3: caller treats None (unavailable) as FAIL, not skip."""
-    if not MORALIS_API_KEY:
-        return None
-
-    headers = {"X-API-Key": MORALIS_API_KEY, "accept": "application/json"}
-    try:
-        if chain_id == "solana":
-            url = f"https://solana-gateway.moralis.io/token/mainnet/{token_address}/holders"
-        else:
-            moralis_chain = MORALIS_CHAIN_MAP.get(chain_id)
-            if not moralis_chain:
-                return None
-            url = f"https://deep-index.moralis.io/api/v2.2/erc20/{token_address}/holders?chain={moralis_chain}"
-
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        return data.get("totalHolders") or data.get("total")
-    except Exception as e:
-        print(f"[error] fetching holder count for {token_address}: {e}")
-        return None
-
-def get_top10_holder_pct(chain_id, token_address):
-    """
-    Correction 4: % of supply held by the top 10 holders.
-    Uses Moralis 'owners' endpoint (EVM) / holders endpoint (Solana).
-    NOTE: this is best-effort — Moralis's exact response shape for this can
-    shift, so verify against a few real tokens during paper testing before
-    trusting it. Returns None if unavailable; caller treats None as FAIL.
-    """
-    if not MORALIS_API_KEY:
-        return None
-
-    headers = {"X-API-Key": MORALIS_API_KEY, "accept": "application/json"}
-    try:
-        if chain_id == "solana":
-            url = f"https://solana-gateway.moralis.io/token/mainnet/{token_address}/top-holders?limit=10"
-        else:
-            moralis_chain = MORALIS_CHAIN_MAP.get(chain_id)
-            if not moralis_chain:
-                return None
-            url = (f"https://deep-index.moralis.io/api/v2.2/erc20/{token_address}/owners"
-                   f"?chain={moralis_chain}&order=DESC&limit=10")
-
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        owners = data.get("result", data if isinstance(data, list) else [])
-        if not owners:
-            return None
-
-        total_pct = 0.0
-        for owner in owners[:10]:
-            pct = owner.get("percentage_relative_to_total_supply") or owner.get("percentage") or 0
-            total_pct += float(pct)
-        return total_pct
-    except Exception as e:
-        print(f"[error] fetching top10 holder pct for {token_address}: {e}")
-        return None
-
 def has_social_presence(pair):
     info = pair.get("info", {})
     return bool(info.get("websites") or info.get("socials"))
+
+def get_goplus_security(chain_id, token_address):
+    """
+    Free, no-key security + holder data via GoPlus.
+    Returns dict with holder_count, top10_pct, is_honeypot, lp_locked_pct,
+    or None if unavailable (caller treats None as FAIL for the relevant checks).
+
+    NOTE: GoPlus's Solana endpoint is newer/less proven than its EVM one —
+    verify its numbers against a few real tokens during paper testing.
+    """
+    try:
+        if chain_id == "solana":
+            url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={token_address}"
+        else:
+            goplus_chain = GOPLUS_CHAIN_MAP.get(chain_id)
+            if not goplus_chain:
+                return None
+            url = f"https://api.gopluslabs.io/api/v1/token_security/{goplus_chain}?contract_addresses={token_address}"
+
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        result = data.get("result", {})
+        token_data = result.get(token_address.lower()) or result.get(token_address)
+        if not token_data:
+            return None
+
+        holder_count_raw = token_data.get("holder_count")
+        holder_count = int(holder_count_raw) if holder_count_raw not in (None, "") else None
+
+        holders = token_data.get("holders", []) or []
+        top10_pct = None
+        if holders:
+            sorted_holders = sorted(holders, key=lambda h: float(h.get("percent", 0) or 0), reverse=True)
+            top10_pct = sum(float(h.get("percent", 0) or 0) for h in sorted_holders[:10]) * 100
+
+        is_honeypot = token_data.get("is_honeypot") == "1"
+        lp_holders = token_data.get("lp_holders", []) or []
+        lp_locked_pct = sum(
+            float(h.get("percent", 0) or 0) * 100
+            for h in lp_holders
+            if h.get("is_locked") in (1, "1")
+        )
+
+        return {
+            "holder_count": holder_count,
+            "top10_pct": top10_pct,
+            "is_honeypot": is_honeypot,
+            "lp_locked_pct": lp_locked_pct,
+        }
+    except Exception as e:
+        print(f"[error] fetching goplus security for {token_address}: {e}")
+        return None
 
 def get_bubblemap_cluster_pct(chain_id, token_address):
     """Best-effort, unofficial endpoint. Returns None (skipped) if unavailable."""
@@ -246,39 +229,6 @@ def get_rugcheck_report(token_address):
         print(f"[error] fetching rugcheck for {token_address}: {e}")
         return None
 
-def get_goplus_security(chain_id, token_address):
-    """
-    Correction 8: Ethereum (and Base) LP-lock + honeypot check via GoPlus
-    Security API (free, no key). Returns dict {is_honeypot, lp_locked_pct}
-    or None if unavailable — caller treats None as FAIL for Ethereum.
-    """
-    goplus_chain = GOPLUS_CHAIN_MAP.get(chain_id)
-    if not goplus_chain:
-        return None
-
-    url = f"https://api.gopluslabs.io/api/v1/token_security/{goplus_chain}?contract_addresses={token_address}"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        result = data.get("result", {})
-        token_data = result.get(token_address.lower())
-        if not token_data:
-            return None
-
-        is_honeypot = token_data.get("is_honeypot") == "1"
-        lp_holders = token_data.get("lp_holders", []) or []
-        lp_locked_pct = sum(
-            float(h.get("percent", 0)) * 100
-            for h in lp_holders
-            if h.get("is_locked") == 1 or h.get("is_locked") == "1"
-        )
-        return {"is_honeypot": is_honeypot, "lp_locked_pct": lp_locked_pct}
-    except Exception as e:
-        print(f"[error] fetching goplus security for {token_address}: {e}")
-        return None
-
 # ============ DUPLICATE NAME CHECK (correction 7) ============
 
 def normalize_name(name):
@@ -296,15 +246,14 @@ def is_duplicate_name(name, alerted_names):
 
 # ============ FILTERING ============
 
-def passes_filters(pair, holder_count, top10_pct, cluster_pct, chain_id,
-                    goplus_data, rugcheck, alerted_names):
+def passes_filters(pair, goplus_data, cluster_pct, chain_id, rugcheck, alerted_names):
     liq = pair.get("liquidity", {}).get("usd", 0) or 0
     vol24 = pair.get("volume", {}).get("h24", 0) or 0
     price_change_1h = pair.get("priceChange", {}).get("h1", 0) or 0
     created_at_ms = pair.get("pairCreatedAt", 0) or 0
     name = pair.get("baseToken", {}).get("name", "")
 
-    # correction 2: age must be known and under 30 minutes
+    # correction 2
     if not created_at_ms:
         return False, "pool age unknown (fail closed)"
     age_minutes = (time.time() * 1000 - created_at_ms) / (1000 * 60)
@@ -322,51 +271,47 @@ def passes_filters(pair, holder_count, top10_pct, cluster_pct, chain_id,
         vol_liq_ratio = vol24 / liq
         if vol_liq_ratio < FILTERS["min_vol_to_liq_ratio"]:
             return False, "vol/liq ratio too low"
-        # correction 6
-        if vol_liq_ratio > FILTERS["max_vol_to_liq_ratio"]:
+        if vol_liq_ratio > FILTERS["max_vol_to_liq_ratio"]:  # correction 6
             return False, "vol/liq ratio too high (wash trading risk)"
 
-    # correction 1: price change must be WITHIN the band, not just above a floor
+    # correction 1
     if not (FILTERS["min_price_change_1h_pct"] <= price_change_1h <= FILTERS["max_price_change_1h_pct"]):
         return False, "1h price change outside +5%/+40% band"
 
     if FILTERS["require_social_link"] and not has_social_presence(pair):
         return False, "no social presence"
 
-    # correction 3: unknown holder count = FAIL, not skip
-    if holder_count is None or holder_count < FILTERS["min_holder_count"]:
+    # corrections 3 & 4: unknown data = FAIL, not skip
+    if goplus_data is None:
+        return False, "holder/security data unavailable (fail closed)"
+    if goplus_data["holder_count"] is None or goplus_data["holder_count"] < FILTERS["min_holder_count"]:
         return False, "holder count too low or unverified"
-
-    # correction 4: unknown top-10 concentration = FAIL, not skip
-    if top10_pct is None or top10_pct >= FILTERS["max_top10_holder_pct"]:
+    if goplus_data["top10_pct"] is None or goplus_data["top10_pct"] >= FILTERS["max_top10_holder_pct"]:
         return False, "top 10 holders too concentrated or unverified"
 
-    # bubble map: best-effort, skips gracefully (not in your correction list)
+    # bubble map: best-effort, skips gracefully
     if cluster_pct is not None and cluster_pct > FILTERS["max_cluster_pct"]:
         return False, "linked wallet cluster too large"
 
-    # correction 8: Ethereum must pass LP-lock + honeypot, else skipped entirely
+    # correction 8: Ethereum only
     if chain_id == "ethereum":
-        if goplus_data is None:
-            return False, "ethereum security check unavailable (fail closed)"
         if goplus_data["is_honeypot"]:
             return False, "honeypot detected"
         if goplus_data["lp_locked_pct"] < FILTERS["min_lp_locked_pct"]:
             return False, "LP not sufficiently locked"
 
-    # correction 10: RugCheck risky score blocks (Solana only, where this applies)
+    # correction 10: Solana only
     if chain_id == "solana":
         if rugcheck is None:
             return False, "rugcheck unavailable (fail closed)"
         score = rugcheck.get("score")
         risks = rugcheck.get("risks", []) or []
-        has_danger_risk = any(r.get("level") == "danger" for r in risks)
-        if has_danger_risk:
+        if any(r.get("level") == "danger" for r in risks):
             return False, "rugcheck flagged a danger-level risk"
         if score is not None and score > FILTERS["max_rugcheck_score"]:
             return False, "rugcheck score too risky"
 
-    # correction 7: duplicate/copycat name check
+    # correction 7
     if is_duplicate_name(name, alerted_names):
         return False, "duplicate or copycat name already alerted"
 
@@ -389,7 +334,7 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"[error] sending telegram alert: {e}")
 
-def format_alert(pair, rugcheck, holder_count, top10_pct, cluster_pct, goplus_data, price_usd):
+def format_alert(pair, rugcheck, goplus_data, cluster_pct, price_usd):
     name = pair.get("baseToken", {}).get("name", "Unknown")
     symbol = pair.get("baseToken", {}).get("symbol", "?")
     address = pair.get("baseToken", {}).get("address", "")
@@ -405,12 +350,12 @@ def format_alert(pair, rugcheck, holder_count, top10_pct, cluster_pct, goplus_da
         f"Liquidity: ${liq:,.0f}",
         f"24h Volume: ${vol24:,.0f}",
         f"1h Change: {change1h:+.1f}%",
-        f"Holders: {holder_count}",
-        f"Top 10 holders: {top10_pct:.1f}%" if top10_pct is not None else "Top 10 holders: N/A",
+        f"Holders: {goplus_data['holder_count']}",
+        f"Top 10 holders: {goplus_data['top10_pct']:.1f}%",
         f"Largest linked cluster: {f'{cluster_pct:.1f}%' if cluster_pct is not None else 'N/A'}",
     ]
 
-    if goplus_data:
+    if chain == "ethereum":
         lines.append(f"LP locked: {goplus_data['lp_locked_pct']:.1f}%")
         lines.append(f"Honeypot: {'YES - BLOCKED' if goplus_data['is_honeypot'] else 'No'}")
 
@@ -430,7 +375,7 @@ def format_alert(pair, rugcheck, holder_count, top10_pct, cluster_pct, goplus_da
 # ============ MAIN (single scan, then exit) ============
 
 def main():
-    print("Meme coin scanner — single run (GitHub Actions mode, strict v2). Alert-only.")
+    print("Meme coin scanner — single run (GitHub Actions mode, v3). Alert-only.")
     seen = load_json_set(SEEN_FILE)
     alerted_names = load_json_set(NAMES_FILE)
     signal_log = load_signal_log()
@@ -452,16 +397,11 @@ def main():
             seen.add(token_address)
             continue
 
-        holder_count = get_holder_count(chain_id, token_address)
-        top10_pct = get_top10_holder_pct(chain_id, token_address)
+        goplus_data = get_goplus_security(chain_id, token_address)
         cluster_pct = get_bubblemap_cluster_pct(chain_id, token_address)
-        goplus_data = get_goplus_security(chain_id, token_address) if chain_id == "ethereum" else None
         rugcheck = get_rugcheck_report(token_address) if chain_id == "solana" else None
 
-        ok, reason = passes_filters(
-            pair, holder_count, top10_pct, cluster_pct, chain_id,
-            goplus_data, rugcheck, alerted_names
-        )
+        ok, reason = passes_filters(pair, goplus_data, cluster_pct, chain_id, rugcheck, alerted_names)
         seen.add(token_address)
 
         if not ok:
@@ -471,10 +411,9 @@ def main():
         price_usd = pair.get("priceUsd")
         name = pair.get("baseToken", {}).get("name", "")
 
-        message = format_alert(pair, rugcheck, holder_count, top10_pct, cluster_pct, goplus_data, price_usd)
+        message = format_alert(pair, rugcheck, goplus_data, cluster_pct, price_usd)
         send_telegram_alert(message)
 
-        # correction 9: log price at moment of signal
         signal_log.append({
             "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "name": name,
